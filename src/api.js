@@ -76,6 +76,10 @@ async function refreshSession() {
   return data;
 }
 
+export async function refreshAuthSession() {
+  return refreshSession();
+}
+
 export async function apiRequest(path, options = {}, retry = true) {
   const { body, headers, ...rest } = options;
   const requestHeaders = buildHeaders(headers);

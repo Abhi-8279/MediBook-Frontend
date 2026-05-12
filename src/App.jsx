@@ -17,15 +17,17 @@ import {
   useParams,
   useSearchParams
 } from "react-router-dom";
-import { ApiError, apiRequest, bindAuthHandlers } from "./api";
+import { ApiError, apiRequest, apiUrl, bindAuthHandlers, refreshAuthSession } from "./api";
 
 const AuthContext = createContext(null);
+const POST_OAUTH_REDIRECT_KEY = "medibook-post-oauth-redirect";
 
 const PAYMENT_MODES = ["CARD", "UPI", "WALLET", "CASH"];
+const ONLINE_PAYMENT_MODES = ["CARD", "UPI", "WALLET"];
 const PAYMENT_STATUSES = ["PENDING", "PAID", "REFUNDED", "FAILED"];
 const CONSULTATION_MODES = ["IN_PERSON", "TELECONSULTATION"];
 const NOTIFICATION_CHANNELS = ["APP", "EMAIL", "SMS"];
-const NOTIFICATION_TYPES = ["BOOKING", "REMINDER", "CANCELLATION", "PAYMENT", "FOLLOWUP", "BROADCAST"];
+const NOTIFICATION_TYPES = ["BOOKING", "REMINDER", "CANCELLATION", "PAYMENT", "FOLLOWUP", "BROADCAST", "SECURITY"];
 const BROADCAST_AUDIENCES = ["ALL", "PATIENT", "PROVIDER"];
 const APPOINTMENT_STATUSES = ["SCHEDULED", "COMPLETED", "CANCELLED", "NO_SHOW"];
 const RECURRENCE_TYPES = ["DAILY", "WEEKLY", "CUSTOM"];
@@ -72,6 +74,38 @@ const QUALIFICATION_OPTIONS = [
   "PhD Clinical Psychology",
   "MPH"
 ];
+const FOOTER_SERVICE_ITEMS = [
+  {
+    mark: "RX",
+    title: "Trusted Meds",
+    description: "Prescription support, refill-friendly notes, and cleaner medication follow-up."
+  },
+  {
+    mark: "LAB",
+    title: "Diagnostics",
+    description: "Lab-ready care journeys with records, invoices, and visit context in one place."
+  },
+  {
+    mark: "DENT",
+    title: "Dental Care",
+    description: "From checkups to specialist bookings, dental visits stay easy to track."
+  },
+  {
+    mark: "24/7",
+    title: "Teleconsults",
+    description: "Online appointments, reminders, and post-visit follow-up without the clutter."
+  }
+];
+const FOOTER_TRUST_BADGES = [
+  { mark: "SEC", label: "Secure payments" },
+  { mark: "DOC", label: "Verified providers" },
+  { mark: "REC", label: "Medical records" },
+  { mark: "SUP", label: "Follow-up support" }
+];
+const RAZORPAY_CHECKOUT_URL =
+  import.meta.env.VITE_RAZORPAY_CHECKOUT_URL || "https://checkout.razorpay.com/v1/checkout.js";
+
+let razorpayScriptPromise = null;
 
 function useAuth() {
   return useContext(AuthContext);
@@ -116,6 +150,24 @@ function normalizeAuthResponse(response) {
   };
 }
 
+function storePostOAuthRedirect(destination) {
+  try {
+    window.sessionStorage.setItem(POST_OAUTH_REDIRECT_KEY, destination || "/dashboard");
+  } catch (error) {
+    // Ignore sessionStorage issues and fall back to the default destination later.
+  }
+}
+
+function consumePostOAuthRedirect() {
+  try {
+    const destination = window.sessionStorage.getItem(POST_OAUTH_REDIRECT_KEY);
+    window.sessionStorage.removeItem(POST_OAUTH_REDIRECT_KEY);
+    return destination || "/dashboard";
+  } catch (error) {
+    return "/dashboard";
+  }
+}
+
 function buildQuery(params) {
   const query = new URLSearchParams();
 
@@ -155,6 +207,192 @@ function getErrorMessage(error) {
   return "Something went wrong.";
 }
 
+function isOnlinePaymentMode(mode) {
+  return ONLINE_PAYMENT_MODES.includes(mode);
+}
+
+function formatRazorpayContact(phone) {
+  if (!phone) {
+    return undefined;
+  }
+
+  const trimmed = phone.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  const digits = trimmed.replace(/\D/g, "");
+  if (!digits) {
+    return undefined;
+  }
+
+  if (trimmed.startsWith("+")) {
+    return `+${digits}`;
+  }
+
+  if (digits.length === 10) {
+    return `+91${digits}`;
+  }
+
+  return `+${digits}`;
+}
+
+function loadRazorpayCheckoutScript() {
+  if (typeof window === "undefined") {
+    return Promise.reject(new Error("Razorpay checkout is only available in the browser."));
+  }
+
+  if (window.Razorpay) {
+    return Promise.resolve(window.Razorpay);
+  }
+
+  if (!razorpayScriptPromise) {
+    razorpayScriptPromise = new Promise((resolve, reject) => {
+      const script = document.createElement("script");
+      script.src = RAZORPAY_CHECKOUT_URL;
+      script.async = true;
+      script.onload = () => resolve(window.Razorpay);
+      script.onerror = () => {
+        razorpayScriptPromise = null;
+        reject(new Error("Unable to load Razorpay Checkout right now."));
+      };
+      document.body.appendChild(script);
+    });
+  }
+
+  return razorpayScriptPromise;
+}
+
+async function startPatientCheckoutPayment({ appointmentId, amount, mode, notes, authUser }) {
+  const normalizedMode = mode || "CARD";
+  const normalizedAmount = Number(amount);
+
+  if (!Number.isFinite(normalizedAmount) || normalizedAmount <= 0) {
+    throw new Error("Enter a valid payment amount before continuing.");
+  }
+
+  if (!isOnlinePaymentMode(normalizedMode)) {
+    return apiRequest("/api/v1/payments/process", {
+      method: "POST",
+      body: {
+        appointmentId,
+        amount: normalizedAmount,
+        mode: "CASH",
+        currency: "INR",
+        notes: notes || null
+      }
+    });
+  }
+
+  await loadRazorpayCheckoutScript();
+
+  const checkoutOrder = await apiRequest("/api/v1/payments/checkout/order", {
+    method: "POST",
+    body: {
+      appointmentId,
+      amount: normalizedAmount,
+      mode: normalizedMode,
+      currency: "INR",
+      notes: notes || null
+    }
+  });
+
+  if (!window.Razorpay) {
+    throw new Error("Razorpay checkout could not be initialized.");
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+
+    async function markFailure(reason, razorpayPaymentId = null, razorpayOrderId = checkoutOrder.razorpayOrderId) {
+      try {
+        await apiRequest("/api/v1/payments/checkout/failure", {
+          method: "POST",
+          body: {
+            paymentId: checkoutOrder.paymentId,
+            razorpayOrderId,
+            razorpayPaymentId,
+            reason
+          }
+        });
+      } catch (error) {
+        // Checkout failure should not block the patient from seeing the original error state.
+      }
+    }
+
+    const razorpay = new window.Razorpay({
+      key: checkoutOrder.keyId,
+      amount: checkoutOrder.amountInSubunits,
+      currency: checkoutOrder.currency,
+      name: checkoutOrder.businessName,
+      description: checkoutOrder.description,
+      image: checkoutOrder.imageUrl || undefined,
+      order_id: checkoutOrder.razorpayOrderId,
+      handler: async (response) => {
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+
+        try {
+          const verifiedPayment = await apiRequest("/api/v1/payments/checkout/confirm", {
+            method: "POST",
+            body: {
+              paymentId: checkoutOrder.paymentId,
+              razorpayOrderId: response.razorpay_order_id,
+              razorpayPaymentId: response.razorpay_payment_id,
+              razorpaySignature: response.razorpay_signature
+            }
+          });
+          resolve(verifiedPayment);
+        } catch (error) {
+          reject(error);
+        }
+      },
+      prefill: {
+        name: authUser?.fullName || undefined,
+        email: authUser?.email || undefined,
+        contact: formatRazorpayContact(authUser?.phone)
+      },
+      notes: {
+        appointmentId: checkoutOrder.appointmentId,
+        paymentId: checkoutOrder.paymentId
+      },
+      theme: {
+        color: "#0f766e"
+      },
+      modal: {
+        ondismiss: async () => {
+          if (settled) {
+            return;
+          }
+
+          settled = true;
+          await markFailure("Checkout dismissed by patient");
+          reject(new Error("Payment was cancelled before completion."));
+        }
+      }
+    });
+
+    razorpay.on("payment.failed", async (response) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      await markFailure(
+        response?.error?.description || response?.error?.reason || "Razorpay payment failed",
+        response?.error?.metadata?.payment_id || null,
+        response?.error?.metadata?.order_id || checkoutOrder.razorpayOrderId
+      );
+      reject(new Error(response?.error?.description || "Payment failed. Please try again."));
+    });
+
+    razorpay.open();
+  });
+}
+
 function formatEnum(value) {
   if (!value) {
     return "Unknown";
@@ -169,7 +407,7 @@ function formatEnum(value) {
 
 function formatDate(value) {
   if (!value) {
-    return "—";
+    return "â€”";
   }
 
   return new Date(`${value}T00:00:00`).toLocaleDateString("en-IN", {
@@ -181,7 +419,7 @@ function formatDate(value) {
 
 function formatTime(value) {
   if (!value) {
-    return "—";
+    return "â€”";
   }
 
   return value.slice(0, 5);
@@ -189,7 +427,7 @@ function formatTime(value) {
 
 function formatInstant(value) {
   if (!value) {
-    return "—";
+    return "â€”";
   }
 
   return new Date(value).toLocaleString("en-IN", {
@@ -339,10 +577,10 @@ function Field({ label, hint, children }) {
   );
 }
 
-function SectionCard({ title, subtitle, actions, children }) {
+function SectionCard({ title, subtitle, actions, children, className, headingClassName }) {
   return (
-    <section className="section-card">
-      <div className="section-head">
+    <section className={classNames("section-card", className)}>
+      <div className={classNames("section-head", headingClassName)}>
         <div>
           <h2>{title}</h2>
           {subtitle ? <p>{subtitle}</p> : null}
@@ -441,7 +679,7 @@ function NotificationFeed({
               <div className="meta-row">
                 <span className="muted">
                   {formatEnum(notification.channel)}
-                  {notification.relatedType ? ` • ${formatEnum(notification.relatedType)}` : ""}
+                  {notification.relatedType ? ` â€¢ ${formatEnum(notification.relatedType)}` : ""}
                 </span>
                 <div className="row-actions">
                   {!notification.read ? (
@@ -474,6 +712,16 @@ function ProtectedRoute({ children }) {
   const auth = useAuth();
   const location = useLocation();
 
+  if (!auth.ready) {
+    return (
+      <div className="page-stack">
+        <section className="section-card">
+          <div className="state-box">Restoring your session...</div>
+        </section>
+      </div>
+    );
+  }
+
   if (!auth.user) {
     return <Navigate to="/auth" replace state={{ from: location.pathname + location.search }} />;
   }
@@ -481,7 +729,7 @@ function ProtectedRoute({ children }) {
   return children;
 }
 
-function AppShell({ children, notice, onClearNotice }) {
+function AppShell({ children, notice, onClearNotice, themeMode, onToggleTheme }) {
   const auth = useAuth();
   const navigate = useNavigate();
 
@@ -508,6 +756,10 @@ function AppShell({ children, notice, onClearNotice }) {
           {!auth.user ? <NavLink to="/auth">Login / Register</NavLink> : null}
         </nav>
         <div className="topbar-side">
+          <button type="button" className="theme-toggle" onClick={onToggleTheme} aria-label="Toggle color theme">
+            <span className={classNames("theme-toggle-indicator", themeMode === "dark" && "is-dark")} />
+            <span className="theme-toggle-label">{themeMode === "dark" ? "Dark mode" : "Light mode"}</span>
+          </button>
           {auth.user ? (
             <>
               <span className="user-chip">
@@ -534,7 +786,46 @@ function AppShell({ children, notice, onClearNotice }) {
         </div>
       ) : null}
       <main className="page">{children}</main>
+      <SiteFooterShowcase />
     </div>
+  );
+}
+
+function SiteFooterShowcase() {
+  return (
+    <footer className="app-footer">
+      <section className="footer-showcase">
+        <div className="footer-showcase-copy">
+          <span className="eyebrow">Medical Services</span>
+          <h2>All major care touchpoints, trusted meds, and secure booking in one place.</h2>
+          <p>
+            MediBook brings booking, payments, invoices, provider trust, and follow-up care into a
+            more reassuring patient experience.
+          </p>
+        </div>
+
+        <div className="footer-service-grid">
+          {FOOTER_SERVICE_ITEMS.map((item) => (
+            <article key={item.title} className="footer-service-card">
+              <span className="footer-service-mark">{item.mark}</span>
+              <div>
+                <h3>{item.title}</h3>
+                <p>{item.description}</p>
+              </div>
+            </article>
+          ))}
+        </div>
+
+        <div className="footer-trust-row">
+          {FOOTER_TRUST_BADGES.map((badge) => (
+            <div key={badge.label} className="footer-trust-badge">
+              <span className="footer-trust-mark">{badge.mark}</span>
+              <strong>{badge.label}</strong>
+            </div>
+          ))}
+        </div>
+      </section>
+    </footer>
   );
 }
 
@@ -545,7 +836,12 @@ function AuthPage() {
   const [mode, setMode] = useState("login");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [oauthRole, setOauthRole] = useState("PATIENT");
+  const [showForgotPassword, setShowForgotPassword] = useState(false);
+  const [forgotLoading, setForgotLoading] = useState(false);
+  const [forgotMessage, setForgotMessage] = useState("");
   const [loginForm, setLoginForm] = useState({ email: "", password: "" });
+  const [forgotEmail, setForgotEmail] = useState("");
   const [registerForm, setRegisterForm] = useState({
     fullName: "",
     email: "",
@@ -556,6 +852,11 @@ function AuthPage() {
   });
 
   const destination = location.state?.from || "/dashboard";
+
+  function handleGoogleLogin() {
+    storePostOAuthRedirect(destination);
+    window.location.assign(apiUrl(`/oauth2/authorization/google?role=${oauthRole}`));
+  }
 
   async function handleLogin(event) {
     event.preventDefault();
@@ -587,24 +888,119 @@ function AuthPage() {
     }
   }
 
+  async function handleForgotPassword(event) {
+    event?.preventDefault?.();
+    setForgotLoading(true);
+    setError("");
+    setForgotMessage("");
+
+    try {
+      const response = await apiRequest("/api/v1/auth/forgot-password", {
+        method: "POST",
+        body: {
+          email: forgotEmail
+        }
+      });
+      setForgotMessage(response.message || "If the account exists, a reset link has been sent.");
+    } catch (submitError) {
+      setError(getErrorMessage(submitError));
+    } finally {
+      setForgotLoading(false);
+    }
+  }
+
   return (
-    <div className="auth-grid">
-      <section className="hero-panel">
-        <span className="eyebrow">Case Study Frontend</span>
-        <h1>One frontend for guests, patients, providers, and admins.</h1>
-        <p>
-          This UI is wired to your live gateway routes so you can browse providers, manage appointments,
-          work through provider operations, and handle admin workflows from one place.
-        </p>
-        <div className="feature-grid">
-          <StatCard label="Guest" value="Search providers, view slots" tone="neutral" />
-          <StatCard label="Patient" value="Book, pay, review, records" tone="warning" />
-          <StatCard label="Provider" value="Slots, queue, records, revenue" tone="success" />
-          <StatCard label="Admin" value="Verify, moderate, reconcile" tone="danger" />
+    <div className="auth-grid auth-experience">
+      <section className="hero-panel auth-story-panel">
+        <div className="auth-story-top">
+          <span className="eyebrow auth-story-eyebrow">MediBook Care Flow</span>
+          <span className="auth-story-chip">Designed for patients, providers, and support teams</span>
+        </div>
+
+        <div className="auth-story-main">
+          <div className="auth-story-copy">
+            <h1>From search to follow-up, every care step stays organized.</h1>
+            <p>
+              Discover the right doctor, reserve a consultation, manage schedules, track records, and keep
+              communication moving without the usual back-and-forth.
+            </p>
+          </div>
+
+          <aside className="auth-platform-panel">
+            <div className="auth-platform-head">
+              <span className="auth-journey-label">Inside the platform</span>
+              <h3>Three connected views keep the care journey moving.</h3>
+            </div>
+            <div className="auth-platform-grid">
+              <article className="auth-platform-item">
+                <strong>Patient</strong>
+                <span>Search, book, pay, and revisit records without jumping between tools.</span>
+              </article>
+              <article className="auth-platform-item">
+                <strong>Provider</strong>
+                <span>Publish availability, complete visits, and keep follow-up details in one workspace.</span>
+              </article>
+              <article className="auth-platform-item">
+                <strong>Admin</strong>
+                <span>Monitor bookings, provider verification, payments, and notifications across the platform.</span>
+              </article>
+            </div>
+          </aside>
+        </div>
+
+        <div className="auth-story-stats">
+          <div className="auth-story-stat">
+            <strong>Live slots</strong>
+            <span>Patients can see real provider availability before they book.</span>
+          </div>
+          <div className="auth-story-stat">
+            <strong>Unified follow-up</strong>
+            <span>Payments, reviews, notifications, and records stay linked to the appointment flow.</span>
+          </div>
+          <div className="auth-story-stat">
+            <strong>Clear role workspaces</strong>
+            <span>Each role gets a focused dashboard instead of one overloaded screen.</span>
+          </div>
+        </div>
+
+        <div className="auth-role-showcase">
+          <article className="auth-role-card auth-role-card-guest">
+            <span className="auth-role-label">Guest</span>
+            <h3>Browse first</h3>
+            <p>Explore doctors, clinic details, and upcoming slots before creating an account.</p>
+          </article>
+          <article className="auth-role-card auth-role-card-patient">
+            <span className="auth-role-label">Patient</span>
+            <h3>Handle your booking journey</h3>
+            <p>Reserve appointments, track payments, revisit records, and leave reviews after care.</p>
+          </article>
+          <article className="auth-role-card auth-role-card-provider">
+            <span className="auth-role-label">Provider</span>
+            <h3>Run your schedule clearly</h3>
+            <p>Publish availability, manage consultations, complete visits, and maintain patient records.</p>
+          </article>
         </div>
       </section>
 
-      <section className="section-card auth-card">
+      <section className="section-card auth-card auth-console-card">
+        <div className="auth-card-header">
+          <div>
+            <span className="eyebrow auth-console-eyebrow">
+              {mode === "login" ? "Secure Sign In" : "Create Your Account"}
+            </span>
+            <h2>
+              {mode === "login"
+                ? "Continue to your MediBook workspace"
+                : "Open a patient or provider account in minutes"}
+            </h2>
+          </div>
+          <p>
+            {mode === "login"
+              ? "Use your email account or continue with Google to pick up where you left off."
+              : "Register once to manage appointments, schedules, and care updates from one place."}
+          </p>
+        </div>
+
         <Tabs
           items={[
             { key: "login", label: "Login" },
@@ -617,31 +1013,73 @@ function AuthPage() {
         {error ? <div className="state-box state-error">{error}</div> : null}
 
         {mode === "login" ? (
-          <form className="form-grid" onSubmit={handleLogin}>
-            <Field label="Email">
-              <input
-                value={loginForm.email}
-                onChange={(event) => setLoginForm((current) => ({ ...current, email: event.target.value }))}
-                type="email"
-                placeholder="you@example.com"
-                required
-              />
-            </Field>
-            <Field label="Password">
-              <input
-                value={loginForm.password}
-                onChange={(event) => setLoginForm((current) => ({ ...current, password: event.target.value }))}
-                type="password"
-                placeholder="Enter your password"
-                required
-              />
-            </Field>
-            <button type="submit" className="button primary" disabled={loading}>
-              {loading ? "Signing in..." : "Login"}
-            </button>
-          </form>
+          <>
+            <form className="form-grid auth-form-grid" onSubmit={handleLogin}>
+              <Field label="Email">
+                <input
+                  value={loginForm.email}
+                  onChange={(event) => setLoginForm((current) => ({ ...current, email: event.target.value }))}
+                  type="email"
+                  placeholder="you@example.com"
+                  required
+                />
+              </Field>
+              <Field label="Password">
+                <input
+                  value={loginForm.password}
+                  onChange={(event) => setLoginForm((current) => ({ ...current, password: event.target.value }))}
+                  type="password"
+                  placeholder="Enter your password"
+                  required
+                />
+              </Field>
+              <div className="auth-inline-action">
+                <button
+                  type="button"
+                  className="auth-text-button"
+                  onClick={() => {
+                    setShowForgotPassword((current) => !current);
+                    setForgotMessage("");
+                    setError("");
+                    setForgotEmail((current) => current || loginForm.email);
+                  }}
+                >
+                  {showForgotPassword ? "Hide password reset" : "Forgot password?"}
+                </button>
+              </div>
+              <button type="submit" className="button primary auth-submit-button" disabled={loading}>
+                {loading ? "Signing in..." : "Login"}
+              </button>
+            </form>
+            {showForgotPassword ? (
+              <form className="auth-forgot-panel" onSubmit={handleForgotPassword}>
+                <div className="auth-forgot-head">
+                  <strong>Reset your password by email</strong>
+                  <span>
+                    Enter your login email and we will send a secure password reset link through MediBook
+                    notifications.
+                  </span>
+                </div>
+                <div className="auth-forgot-form">
+                  <Field label="Account email">
+                    <input
+                      value={forgotEmail}
+                      onChange={(event) => setForgotEmail(event.target.value)}
+                      type="email"
+                      placeholder="you@example.com"
+                      required
+                    />
+                  </Field>
+                  <button type="submit" className="button ghost" disabled={forgotLoading}>
+                    {forgotLoading ? "Sending..." : "Send reset link"}
+                  </button>
+                </div>
+                {forgotMessage ? <div className="state-box state-success">{forgotMessage}</div> : null}
+              </form>
+            ) : null}
+          </>
         ) : (
-          <form className="form-grid" onSubmit={handleRegister}>
+          <form className="form-grid auth-form-grid" onSubmit={handleRegister}>
             <Field label="Full name">
               <input
                 value={registerForm.fullName}
@@ -697,18 +1135,211 @@ function AuthPage() {
                 placeholder="https://..."
               />
             </Field>
-            <button type="submit" className="button primary" disabled={loading}>
+            <button type="submit" className="button primary auth-submit-button" disabled={loading}>
               {loading ? "Creating account..." : "Create account"}
             </button>
           </form>
         )}
 
-        <p className="muted">
-          Admin users can log in here with the existing backend admin account. OAuth remains backend-driven
-          and can be layered on later if you enable those redirect flows.
-        </p>
+        <div className="auth-divider">
+          <span>Google sign-in</span>
+        </div>
+
+        <div className="auth-oauth-panel">
+          <Field label="Sign in with Google as">
+            <select value={oauthRole} onChange={(event) => setOauthRole(event.target.value)}>
+              <option value="PATIENT">Patient</option>
+              <option value="PROVIDER">Provider</option>
+            </select>
+          </Field>
+          <button type="button" className="button ghost oauth-button" onClick={handleGoogleLogin}>
+            <span className="google-mark" aria-hidden="true">
+              <svg viewBox="0 0 24 24" focusable="false">
+                <path
+                  fill="#4285F4"
+                  d="M21.64 12.2c0-.68-.06-1.33-.17-1.95H12v3.69h5.41a4.63 4.63 0 0 1-2 3.04v2.52h3.24c1.9-1.75 2.99-4.34 2.99-7.3Z"
+                />
+                <path
+                  fill="#34A853"
+                  d="M12 22c2.7 0 4.96-.9 6.61-2.45l-3.24-2.52c-.9.6-2.05.96-3.37.96-2.59 0-4.79-1.75-5.57-4.1H3.08v2.6A9.99 9.99 0 0 0 12 22Z"
+                />
+                <path
+                  fill="#FBBC05"
+                  d="M6.43 13.89A5.98 5.98 0 0 1 6.12 12c0-.66.11-1.3.31-1.89V7.51H3.08A9.99 9.99 0 0 0 2 12c0 1.61.39 3.13 1.08 4.49l3.35-2.6Z"
+                />
+                <path
+                  fill="#EA4335"
+                  d="M12 6.01c1.47 0 2.8.51 3.84 1.52l2.88-2.88C16.95 3 14.69 2 12 2A9.99 9.99 0 0 0 3.08 7.51l3.35 2.6c.78-2.35 2.98-4.1 5.57-4.1Z"
+                />
+              </svg>
+            </span>
+            <span>Continue with Google</span>
+          </button>
+          <p className="field-hint">This choice is used when a Google account is signing in for the first time.</p>
+        </div>
       </section>
     </div>
+  );
+}
+
+function ResetPasswordPage() {
+  const [searchParams] = useSearchParams();
+  const token = searchParams.get("token") || "";
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [successMessage, setSuccessMessage] = useState("");
+  const [form, setForm] = useState({
+    newPassword: "",
+    confirmPassword: ""
+  });
+
+  async function handleResetPassword(event) {
+    event.preventDefault();
+    setError("");
+    setSuccessMessage("");
+
+    if (!token) {
+      setError("Reset token is missing from this link.");
+      return;
+    }
+
+    if (form.newPassword !== form.confirmPassword) {
+      setError("Confirm password must match the new password.");
+      return;
+    }
+
+    setLoading(true);
+
+    try {
+      const response = await apiRequest("/api/v1/auth/reset-password", {
+        method: "POST",
+        body: {
+          token,
+          newPassword: form.newPassword
+        }
+      });
+      setSuccessMessage(response.message || "Password reset successfully. You can log in now.");
+      setForm({
+        newPassword: "",
+        confirmPassword: ""
+      });
+    } catch (submitError) {
+      setError(getErrorMessage(submitError));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <section className="section-card auth-card auth-console-card auth-reset-page">
+      <div className="auth-card-header">
+        <div>
+          <span className="eyebrow auth-console-eyebrow">Password Reset</span>
+          <h2>Choose a new MediBook password</h2>
+        </div>
+        <p>Use the secure link from your email to set a new password for your account.</p>
+      </div>
+
+      {!token ? <div className="state-box state-error">Reset token is missing from this link.</div> : null}
+      {error ? <div className="state-box state-error">{error}</div> : null}
+      {successMessage ? <div className="state-box state-success">{successMessage}</div> : null}
+
+      <form className="form-grid auth-form-grid" onSubmit={handleResetPassword}>
+        <Field label="New password" hint="Minimum 8 characters.">
+          <input
+            value={form.newPassword}
+            onChange={(event) => setForm((current) => ({ ...current, newPassword: event.target.value }))}
+            type="password"
+            placeholder="Create a strong password"
+            required
+            minLength={8}
+          />
+        </Field>
+        <Field label="Confirm password">
+          <input
+            value={form.confirmPassword}
+            onChange={(event) => setForm((current) => ({ ...current, confirmPassword: event.target.value }))}
+            type="password"
+            placeholder="Re-enter your new password"
+            required
+            minLength={8}
+          />
+        </Field>
+        <div className="auth-secondary-actions">
+          <button type="submit" className="button primary auth-submit-button" disabled={loading || !token}>
+            {loading ? "Resetting..." : "Reset password"}
+          </button>
+          <Link className="button ghost" to="/auth">
+            Back to login
+          </Link>
+        </div>
+      </form>
+    </section>
+  );
+}
+
+function OAuthRedirectPage() {
+  const auth = useAuth();
+  const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const [error, setError] = useState("");
+  const hasStartedRef = useRef(false);
+
+  useEffect(() => {
+    if (hasStartedRef.current) {
+      return undefined;
+    }
+
+    hasStartedRef.current = true;
+    let cancelled = false;
+
+    async function completeOAuthRedirect() {
+      const accessToken = searchParams.get("accessToken");
+      const refreshToken = searchParams.get("refreshToken");
+      const oauthError = searchParams.get("error");
+
+      if (oauthError) {
+        setError(oauthError);
+        return;
+      }
+
+      if (!accessToken || !refreshToken) {
+        setError("Google sign-in did not return a complete session.");
+        return;
+      }
+
+      try {
+        await auth.completeOAuthLogin({ accessToken, refreshToken });
+
+        if (!cancelled) {
+          navigate(consumePostOAuthRedirect(), { replace: true });
+        }
+      } catch (redirectError) {
+        if (!cancelled) {
+          setError(getErrorMessage(redirectError));
+        }
+      }
+    }
+
+    completeOAuthRedirect();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [auth, navigate, searchParams]);
+
+  return (
+    <section className="section-card oauth-redirect-card">
+      <h3>Finishing Google sign-in</h3>
+      {error ? (
+        <div className="state-box state-error">{error}</div>
+      ) : (
+        <div className="state-box">We are validating your Google session and loading your account.</div>
+      )}
+      <Link className="button ghost" to="/auth">
+        Back to login
+      </Link>
+    </section>
   );
 }
 
@@ -742,15 +1373,15 @@ function HomePage() {
         <div className="hero-copy">
           <span className="eyebrow">Online Appointment Booking System</span>
           <h1>Browse providers, check live slots, and move from discovery to booking fast.</h1>
-          <p>
-            This frontend is aligned to your MediBook case study and connected to the backend gateway so the
-            public directory, detail pages, and role-based dashboards all share the same API contract.
+          <p className="hero-support-copy">
+            MediBook keeps search, scheduling, online payments, and post-visit follow-up in a cleaner
+            patient-first flow.
           </p>
         </div>
         <div className="hero-metrics">
-          <StatCard label="Gateway" value="localhost:8080" tone="neutral" />
-          <StatCard label="Public search" value="Guest-ready" tone="warning" />
-          <StatCard label="Role dashboards" value="Patient • Provider • Admin" tone="success" />
+          <StatCard label="Search experience" value="Guest-ready" tone="warning" />
+          <StatCard label="Payments" value="Razorpay-enabled" tone="success" />
+          <StatCard label="Workspaces" value="Patient, Provider, Admin" tone="success" />
         </div>
       </section>
 
@@ -827,7 +1458,7 @@ function HomePage() {
                 <div className="meta-row">
                   <span>{provider.experienceYears || 0}+ years</span>
                   <span>
-                    {provider.avgRating ? `${provider.avgRating}★` : "No rating"} • {provider.reviewCount || 0} reviews
+                    {provider.avgRating ? `${provider.avgRating} rating` : "No rating"} {provider.reviewCount || 0} reviews
                   </span>
                 </div>
                 <Link className="button primary" to={`/providers/${provider.providerId}`}>
@@ -924,19 +1555,21 @@ function ProviderDetailPage() {
         });
 
         if (bookingForm.payNow) {
-          await apiRequest("/api/v1/payments/process", {
-            method: "POST",
-            body: {
-              appointmentId: appointment.appointmentId,
-              amount: Number(bookingForm.amount),
-              mode: bookingForm.paymentMode,
-              currency: "INR",
-              notes: bookingForm.paymentNotes || null
-            }
+          await startPatientCheckoutPayment({
+            appointmentId: appointment.appointmentId,
+            amount: bookingForm.amount,
+            mode: bookingForm.paymentMode,
+            notes: bookingForm.paymentNotes,
+            authUser: auth.user
           });
+          setActionSuccess(
+            isOnlinePaymentMode(bookingForm.paymentMode)
+              ? "Appointment booked and payment completed successfully."
+              : "Appointment booked successfully. Cash collection stays pending until the clinic receives it."
+          );
+        } else {
+          setActionSuccess("Appointment booked successfully.");
         }
-
-        setActionSuccess("Appointment booked successfully.");
       }
 
       setReloadKey((value) => value + 1);
@@ -1137,7 +1770,7 @@ function ProviderDetailPage() {
                               setBookingForm((current) => ({ ...current, paymentMode: event.target.value }))
                             }
                           >
-                            {PAYMENT_MODES.map((mode) => (
+                            {ONLINE_PAYMENT_MODES.map((mode) => (
                               <option key={mode} value={mode}>
                                 {formatEnum(mode)}
                               </option>
@@ -1190,7 +1823,7 @@ function ProviderDetailPage() {
                 </div>
                 <p>{review.comment || "No written comment."}</p>
                 <div className="meta-row">
-                  <span>{review.anonymous ? "Anonymous patient" : `Patient ${review.patientId}`}</span>
+                  <span>{review.anonymous ? "Anonymous patient" : "Verified patient"}</span>
                   {review.flagged ? <span className="pill pill-danger">Flagged</span> : null}
                 </div>
               </article>
@@ -1220,11 +1853,11 @@ function DashboardPage() {
         </p>
       </section>
 
-      <AccountPanel />
-
       {auth.user.role === "PATIENT" ? <PatientDashboard /> : null}
       {auth.user.role === "PROVIDER" ? <ProviderDashboard /> : null}
       {auth.user.role === "ADMIN" ? <AdminDashboard /> : null}
+
+      <AccountPanel />
     </div>
   );
 }
@@ -1247,6 +1880,7 @@ function AccountPanel() {
   const [passwordMessage, setPasswordMessage] = useState("");
   const profile = useApiResource(null, [refreshKey], () => apiRequest("/api/v1/auth/profile"));
   const profileInfo = profile.data ?? auth.user ?? {};
+  const isLocalAccount = (profileInfo.authProvider || "").toUpperCase() === "LOCAL";
 
   useEffect(() => {
     if (profile.data || auth.user) {
@@ -1289,11 +1923,11 @@ function AccountPanel() {
         method: "PUT",
         body: passwordForm
       });
-      setPasswordMessage(response.message || "Password updated successfully.");
       setPasswordForm({
         currentPassword: "",
         newPassword: ""
       });
+      await auth.logout(response.message || "Password changed successfully. Please sign in again.");
     } catch (submitError) {
       setError(getErrorMessage(submitError));
     } finally {
@@ -1307,10 +1941,21 @@ function AccountPanel() {
       return;
     }
 
+    const passwordConfirmation = isLocalAccount
+      ? window.prompt("Enter your current password to confirm account deactivation.") || ""
+      : null;
+
+    if (isLocalAccount && !passwordConfirmation) {
+      setError("Password confirmation is required to deactivate this account.");
+      return;
+    }
+
     try {
       await apiRequest("/api/v1/auth/deactivate", {
         method: "PUT",
-        body: {}
+        body: {
+          passwordConfirmation
+        }
       });
       await auth.logout();
     } catch (deactivateError) {
@@ -1319,7 +1964,12 @@ function AccountPanel() {
   }
 
   return (
-    <SectionCard title="Account Settings" subtitle="Update your profile, password, and account state.">
+    <SectionCard
+      title="Account Settings"
+      subtitle="Keep profile, password, and account state up to date without taking over the dashboard."
+      className="account-panel-shell"
+      headingClassName="compact"
+    >
       <DataState
         loading={profile.loading}
         error={profile.error}
@@ -1360,15 +2010,10 @@ function AccountPanel() {
                 <span className="muted">Created</span>
                 <strong>{formatInstant(profileInfo.createdAt)}</strong>
               </div>
-              <div>
-                <span className="muted">User ID</span>
-                <strong>{profileInfo.userId || "Unavailable"}</strong>
-              </div>
             </div>
-          </div>
 
-          <div className="account-forms">
-            <form className="info-card account-form-card" onSubmit={handleProfileSave}>
+            <form className="account-summary-editor" onSubmit={handleProfileSave}>
+              <div className="account-summary-divider" />
               <h3>Edit profile</h3>
               <div className="account-form-grid">
                 <Field label="Full name">
@@ -1401,38 +2046,68 @@ function AccountPanel() {
               </div>
             </form>
 
-            <form className="info-card account-form-card" onSubmit={handlePasswordChange}>
+            <div className="account-summary-divider" />
+            <div className="account-summary-editor">
               <h3>Change password</h3>
-              <div className="account-form-grid">
-                <Field label="Current password">
-                  <input
-                    type="password"
-                    value={passwordForm.currentPassword}
-                    onChange={(event) =>
-                      setPasswordForm((current) => ({ ...current, currentPassword: event.target.value }))
-                    }
-                  />
-                </Field>
-                <Field label="New password">
-                  <input
-                    type="password"
-                    value={passwordForm.newPassword}
-                    onChange={(event) =>
-                      setPasswordForm((current) => ({ ...current, newPassword: event.target.value }))
-                    }
-                  />
-                </Field>
-              </div>
-              {passwordMessage ? <div className="state-box state-success">{passwordMessage}</div> : null}
-              <div className="account-actions">
-                <button type="submit" className="button primary" disabled={savingPassword}>
-                  {savingPassword ? "Updating..." : "Update password"}
-                </button>
-                <button type="button" className="button ghost danger" onClick={handleDeactivate}>
-                  Deactivate account
-                </button>
-              </div>
-            </form>
+              {isLocalAccount ? (
+                <form onSubmit={handlePasswordChange}>
+                  <div className="account-form-grid">
+                    <Field label="Current password">
+                      <input
+                        type="password"
+                        value={passwordForm.currentPassword}
+                        onChange={(event) =>
+                          setPasswordForm((current) => ({ ...current, currentPassword: event.target.value }))
+                        }
+                      />
+                    </Field>
+                    <Field label="New password">
+                      <input
+                        type="password"
+                        value={passwordForm.newPassword}
+                        onChange={(event) =>
+                          setPasswordForm((current) => ({ ...current, newPassword: event.target.value }))
+                        }
+                      />
+                    </Field>
+                  </div>
+                  {passwordMessage ? <div className="state-box state-success">{passwordMessage}</div> : null}
+                  <div className="account-actions">
+                    <button type="submit" className="button primary" disabled={savingPassword}>
+                      {savingPassword ? "Updating..." : "Update password"}
+                    </button>
+                  </div>
+                  <div className="account-danger-zone">
+                    <div className="account-danger-copy">
+                      <h4>Deactivate account</h4>
+                      <p>
+                        This will disable your account and revoke access until an administrator restores it.
+                      </p>
+                    </div>
+                    <button type="button" className="button ghost danger" onClick={handleDeactivate}>
+                      Deactivate account
+                    </button>
+                  </div>
+                </form>
+              ) : (
+                <>
+                  <p className="muted">
+                    Password changes are managed by {formatEnum(profileInfo.authProvider)} for this account.
+                  </p>
+                  <div className="account-danger-zone">
+                    <div className="account-danger-copy">
+                      <h4>Deactivate account</h4>
+                      <p>
+                        If you no longer want to use this account, you can disable it here.
+                      </p>
+                    </div>
+                    <button type="button" className="button ghost danger" onClick={handleDeactivate}>
+                      Deactivate account
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
           </div>
         </div>
         {error ? <div className="state-box state-error">{error}</div> : null}
@@ -1442,6 +2117,7 @@ function AccountPanel() {
 }
 
 function PatientDashboard() {
+  const auth = useAuth();
   const [activeTab, setActiveTab] = useState("appointments");
   const [refreshKey, setRefreshKey] = useState(0);
   const [cancelReasons, setCancelReasons] = useState({});
@@ -1487,16 +2163,21 @@ function PatientDashboard() {
     try {
       setSectionError("");
       const draft = paymentDrafts[appointmentId] || {};
-      await apiRequest("/api/v1/payments/process", {
-        method: "POST",
-        body: {
-          appointmentId,
-          amount: Number(draft.amount),
-          mode: draft.mode || "CARD",
-          currency: "INR",
-          notes: draft.notes || null
-        }
+      await startPatientCheckoutPayment({
+        appointmentId,
+        amount: draft.amount,
+        mode: draft.mode || "CARD",
+        notes: draft.notes,
+        authUser: auth.user
       });
+      setPaymentDrafts((current) => ({
+        ...current,
+        [appointmentId]: {
+          amount: "",
+          mode: "CARD",
+          notes: ""
+        }
+      }));
       refreshAll();
     } catch (error) {
       setSectionError(getErrorMessage(error));
@@ -1585,6 +2266,16 @@ function PatientDashboard() {
     refreshAll();
   }
 
+  const appointmentStatusById = new Map(
+    appointments.data.map((appointment) => [appointment.appointmentId, appointment.status])
+  );
+
+  function canOpenInvoice(payment) {
+    const appointmentStatus = appointmentStatusById.get(payment.appointmentId);
+    const hasCompletedPayment = payment.status === "PAID" || payment.status === "REFUNDED";
+    return hasCompletedPayment && appointmentStatus === "COMPLETED";
+  }
+
   const tabs = [
     { key: "appointments", label: "Appointments" },
     { key: "payments", label: "Payments" },
@@ -1621,12 +2312,12 @@ function PatientDashboard() {
                         {formatEnum(appointment.status)}
                       </span>
                       <span className="muted">
-                        {formatDate(appointment.appointmentDate)} • {formatTime(appointment.startTime)} - {formatTime(appointment.endTime)}
+                        {formatDate(appointment.appointmentDate)} â€¢ {formatTime(appointment.startTime)} - {formatTime(appointment.endTime)}
                       </span>
                     </div>
                     <h3>{appointment.serviceType}</h3>
                     <p>
-                      Provider ID: {appointment.providerId} • Mode: {formatEnum(appointment.modeOfConsultation)}
+                      Consultation mode: {formatEnum(appointment.modeOfConsultation)}
                     </p>
                     {appointment.notes ? <p className="muted">Notes: {appointment.notes}</p> : null}
                     <div className="row-actions">
@@ -1692,7 +2383,7 @@ function PatientDashboard() {
                                 }))
                               }
                             >
-                              {PAYMENT_MODES.map((mode) => (
+                              {ONLINE_PAYMENT_MODES.map((mode) => (
                                 <option key={mode} value={mode}>
                                   {formatEnum(mode)}
                                 </option>
@@ -1719,7 +2410,7 @@ function PatientDashboard() {
                           className="button primary"
                           onClick={() => processPayment(appointment.appointmentId)}
                         >
-                          Process payment
+                          Pay with Razorpay
                         </button>
                       </details>
                       {appointment.status === "COMPLETED" ? (
@@ -1760,7 +2451,7 @@ function PatientDashboard() {
                     </div>
                     <h3>{appointment.serviceType}</h3>
                     <p>
-                      {formatTime(appointment.startTime)} - {formatTime(appointment.endTime)} • Provider {appointment.providerId}
+                      {formatTime(appointment.startTime)} - {formatTime(appointment.endTime)}
                     </p>
                     {appointment.cancellationReason ? (
                       <p className="muted">Cancellation reason: {appointment.cancellationReason}</p>
@@ -1781,10 +2472,6 @@ function PatientDashboard() {
                 <div>
                   <span className="muted">Invoice number</span>
                   <strong>{invoice.invoiceNumber}</strong>
-                </div>
-                <div>
-                  <span className="muted">Appointment ID</span>
-                  <strong>{invoice.appointmentId}</strong>
                 </div>
                 <div>
                   <span className="muted">Amount</span>
@@ -1822,18 +2509,20 @@ function PatientDashboard() {
                       <span className="muted">{formatInstant(payment.createdAt)}</span>
                     </div>
                     <h3>{formatCurrency(payment.amount, payment.currency || "INR")}</h3>
-                    <p>
-                      Appointment {payment.appointmentId} • {formatEnum(payment.mode)}
-                    </p>
-                    <div className="row-actions">
-                      <button
-                        type="button"
-                        className="button ghost"
-                        onClick={() => loadInvoice(payment.paymentId)}
-                      >
-                        Open invoice
-                      </button>
-                    </div>
+                    <p>{formatEnum(payment.mode)}</p>
+                    {canOpenInvoice(payment) ? (
+                      <div className="row-actions">
+                        <button
+                          type="button"
+                          className="button ghost"
+                          onClick={() => loadInvoice(payment.paymentId)}
+                        >
+                          Open invoice
+                        </button>
+                      </div>
+                    ) : (
+                      <p className="muted">Invoice becomes available after payment is completed and the appointment is marked completed.</p>
+                    )}
                   </article>
                 ))}
               </div>
@@ -1854,14 +2543,14 @@ function PatientDashboard() {
               {records.data.map((record) => (
                 <article key={record.recordId} className="info-card">
                   <div className="meta-row">
-                    <span className="pill pill-neutral">Appointment {record.appointmentId}</span>
+                    <span className="pill pill-neutral">Medical record</span>
                     <span className="muted">{formatInstant(record.createdAt)}</span>
                   </div>
                   <h3>{record.diagnosis}</h3>
                   <p>{record.prescription}</p>
                   {record.notes ? <p className="muted">{record.notes}</p> : null}
                   <div className="meta-row">
-                    <span>Provider {record.providerId}</span>
+                    <span>Provider record</span>
                     <span>Follow-up: {record.followUpDate ? formatDate(record.followUpDate) : "Not set"}</span>
                   </div>
                   {record.attachmentUrl ? (
@@ -1890,6 +2579,9 @@ function PatientDashboard() {
                   required
                 />
               </Field>
+              <p className="form-helper-text">
+                Use the completed appointment ID here, not the slot ID shown in provider schedules.
+              </p>
               <Field label="Rating">
                 <select
                   value={String(reviewForm.rating)}
@@ -1964,7 +2656,7 @@ function PatientDashboard() {
                       <span className="pill pill-warning">{review.rating} / 5</span>
                       <span className="muted">{formatInstant(review.reviewDate)}</span>
                     </div>
-                    <h3>Appointment {review.appointmentId}</h3>
+                    <h3>Appointment review</h3>
                     <p>{review.comment || "No written comment."}</p>
                     <div className="row-actions">
                       <button
@@ -2455,21 +3147,28 @@ function ProviderDashboard() {
             data={profileMissing ? {} : providerProfile}
             emptyMessage="Provider profile is not set up yet."
           >
-            <div className="detail-grid">
+            <div className="provider-profile-layout">
               {!profileMissing && providerProfile ? (
-                <div className="info-card">
-                  <div className="meta-row">
-                    <span className={classNames("pill", `pill-${statusTone(providerProfile.verified ? "VERIFIED" : "PENDING")}`)}>
-                      {providerProfile.verified ? "Verified" : "Awaiting review"}
-                    </span>
-                    <span className={classNames("pill", `pill-${statusTone(providerProfile.available ? "ACTIVE" : "INACTIVE")}`)}>
-                      {providerProfile.available ? "Available" : "Unavailable"}
-                    </span>
+                <div className="info-card provider-summary-card">
+                  <div className="provider-summary-head">
+                    <div className="avatar-shell large">
+                      {providerProfile.fullName?.charAt(0)?.toUpperCase() || "P"}
+                    </div>
+                    <div className="provider-summary-copy">
+                      <div className="meta-row">
+                        <span className={classNames("pill", `pill-${statusTone(providerProfile.verified ? "VERIFIED" : "PENDING")}`)}>
+                          {providerProfile.verified ? "Verified" : "Awaiting review"}
+                        </span>
+                        <span className={classNames("pill", `pill-${statusTone(providerProfile.available ? "ACTIVE" : "INACTIVE")}`)}>
+                          {providerProfile.available ? "Available" : "Unavailable"}
+                        </span>
+                      </div>
+                      <h3>{providerProfile.fullName}</h3>
+                      <p className="provider-summary-specialization">{providerProfile.specialization}</p>
+                    </div>
                   </div>
-                  <h3>{providerProfile.fullName}</h3>
-                  <p>{providerProfile.specialization}</p>
-                  <p>{providerProfile.bio || "No bio yet."}</p>
-                  <div className="key-grid">
+                  <p className="provider-summary-bio">{providerProfile.bio || "No bio yet."}</p>
+                  <div className="key-grid provider-summary-grid">
                     <div>
                       <span className="muted">Clinic</span>
                       <strong>{providerProfile.clinicName}</strong>
@@ -2487,97 +3186,115 @@ function ProviderDashboard() {
                       <strong>{providerProfile.experienceYears || 0}+ years</strong>
                     </div>
                   </div>
-                  <div className="row-actions">
-                    <button type="button" className="button ghost" onClick={() => toggleAvailability(true)}>
+                  <div className="account-actions provider-summary-actions">
+                    <button type="button" className="button ghost provider-toggle-button" onClick={() => toggleAvailability(true)}>
                       Set Available
                     </button>
-                    <button type="button" className="button ghost danger" onClick={() => toggleAvailability(false)}>
+                    <button type="button" className="button ghost danger provider-toggle-button" onClick={() => toggleAvailability(false)}>
                       Set Unavailable
                     </button>
                   </div>
                   {providerProfile.verificationNote ? (
-                    <p className="muted">Verification note: {providerProfile.verificationNote}</p>
+                    <div className="state-box provider-verification-note">
+                      Verification note: {providerProfile.verificationNote}
+                    </div>
                   ) : null}
                 </div>
               ) : null}
 
-              <form className="info-card form-grid" onSubmit={submitProviderProfile}>
-                <h3>{profileMissing ? "Create profile" : "Update profile"}</h3>
-                <Field label="Specialization">
-                  <input
-                    list="provider-specialization-options"
-                    value={providerForm.specialization}
-                    onChange={(event) =>
-                      setProviderForm((current) => ({ ...current, specialization: event.target.value }))
-                    }
-                    placeholder="Cardiologist, ENT Specialist, Dentist..."
-                    required
-                  />
-                </Field>
-                <Field label="Qualification">
-                  <input
-                    list="provider-qualification-options"
-                    value={providerForm.qualification}
-                    onChange={(event) =>
-                      setProviderForm((current) => ({ ...current, qualification: event.target.value }))
-                    }
-                    placeholder="MBBS, BDS, MD..."
-                    required
-                  />
-                </Field>
-                <Field label="Experience years">
-                  <input
-                    type="number"
-                    min="0"
-                    max="80"
-                    value={providerForm.experienceYears}
-                    onChange={(event) =>
-                      setProviderForm((current) => ({ ...current, experienceYears: event.target.value }))
-                    }
-                    required
-                  />
-                </Field>
-                <Field label="Clinic name">
-                  <input
-                    value={providerForm.clinicName}
-                    onChange={(event) =>
-                      setProviderForm((current) => ({ ...current, clinicName: event.target.value }))
-                    }
-                    required
-                  />
-                </Field>
-                <Field label="Clinic address">
-                  <input
-                    value={providerForm.clinicAddress}
-                    onChange={(event) =>
-                      setProviderForm((current) => ({ ...current, clinicAddress: event.target.value }))
-                    }
-                    required
-                  />
-                </Field>
-                {profileMissing ? (
-                  <Field label="Available now">
-                    <select
-                      value={String(providerForm.available)}
+              <form className="info-card provider-editor-card" onSubmit={submitProviderProfile}>
+                <div className="provider-editor-head">
+                  <div>
+                    <h3>{profileMissing ? "Create profile" : "Update profile"}</h3>
+                    <p>Keep the public-facing information polished, trustworthy, and easy for patients to scan.</p>
+                  </div>
+                </div>
+                <div className="account-form-grid provider-editor-grid">
+                  <Field label="Specialization">
+                    <input
+                      list="provider-specialization-options"
+                      value={providerForm.specialization}
                       onChange={(event) =>
-                        setProviderForm((current) => ({ ...current, available: event.target.value === "true" }))
+                        setProviderForm((current) => ({ ...current, specialization: event.target.value }))
                       }
-                    >
-                      <option value="true">Yes</option>
-                      <option value="false">No</option>
-                    </select>
+                      placeholder="Cardiologist, ENT Specialist, Dentist..."
+                      required
+                    />
                   </Field>
-                ) : null}
-                <Field label="Bio">
-                  <textarea
-                    rows={4}
-                    value={providerForm.bio}
-                    onChange={(event) => setProviderForm((current) => ({ ...current, bio: event.target.value }))}
-                  />
-                </Field>
-                <button type="submit" className="button primary">
-                  {profileMissing ? "Register Provider Profile" : "Save Provider Profile"}
-                </button>
+                  <Field label="Qualification">
+                    <input
+                      list="provider-qualification-options"
+                      value={providerForm.qualification}
+                      onChange={(event) =>
+                        setProviderForm((current) => ({ ...current, qualification: event.target.value }))
+                      }
+                      placeholder="MBBS, BDS, MD..."
+                      required
+                    />
+                  </Field>
+                  <Field label="Experience years">
+                    <input
+                      type="number"
+                      min="0"
+                      max="80"
+                      value={providerForm.experienceYears}
+                      onChange={(event) =>
+                        setProviderForm((current) => ({ ...current, experienceYears: event.target.value }))
+                      }
+                      required
+                    />
+                  </Field>
+                  {profileMissing ? (
+                    <Field label="Available now">
+                      <select
+                        value={String(providerForm.available)}
+                        onChange={(event) =>
+                          setProviderForm((current) => ({ ...current, available: event.target.value === "true" }))
+                        }
+                      >
+                        <option value="true">Yes</option>
+                        <option value="false">No</option>
+                      </select>
+                    </Field>
+                  ) : (
+                    <Field label="Profile state" hint="Availability can also be changed from the summary card.">
+                      <input value={providerProfile?.available ? "Available" : "Unavailable"} disabled />
+                    </Field>
+                  )}
+                  <Field label="Clinic name">
+                    <input
+                      value={providerForm.clinicName}
+                      onChange={(event) =>
+                        setProviderForm((current) => ({ ...current, clinicName: event.target.value }))
+                      }
+                      required
+                    />
+                  </Field>
+                  <Field label="Clinic address">
+                    <input
+                      value={providerForm.clinicAddress}
+                      onChange={(event) =>
+                        setProviderForm((current) => ({ ...current, clinicAddress: event.target.value }))
+                      }
+                      required
+                    />
+                  </Field>
+                  <Field label="Bio">
+                    <textarea
+                      rows={4}
+                      value={providerForm.bio}
+                      onChange={(event) => setProviderForm((current) => ({ ...current, bio: event.target.value }))}
+                    />
+                  </Field>
+                </div>
+                <div className="provider-editor-actions">
+                  <p className="muted">
+                    Patients see this profile before they book, so short, specific details work best.
+                  </p>
+                  <button type="submit" className="button primary provider-save-button">
+                    {profileMissing ? "Register Provider Profile" : "Save Provider Profile"}
+                  </button>
+                </div>
                 <datalist id="provider-specialization-options">
                   {SPECIALIZATION_OPTIONS.map((option) => (
                     <option key={option} value={option} />
@@ -2598,141 +3315,166 @@ function ProviderDashboard() {
         <div className="stack-list">
           {providerReady ? (
             <>
-              <div className="detail-grid">
-                <form className="info-card form-grid" onSubmit={addSingleSlot}>
-                  <h3>Add single slot</h3>
-                  <Field label="Date">
-                    <input
-                      type="date"
-                      value={singleSlotForm.date}
-                      onChange={(event) => setSingleSlotForm((current) => ({ ...current, date: event.target.value }))}
-                    />
-                  </Field>
-                  <Field label="Start time">
-                    <input
-                      type="time"
-                      value={singleSlotForm.startTime}
-                      onChange={(event) =>
-                        setSingleSlotForm((current) => ({ ...current, startTime: event.target.value }))
-                      }
-                    />
-                  </Field>
-                  <Field label="End time">
-                    <input
-                      type="time"
-                      value={singleSlotForm.endTime}
-                      onChange={(event) => setSingleSlotForm((current) => ({ ...current, endTime: event.target.value }))}
-                    />
-                  </Field>
-                  <Field label="Duration minutes">
-                    <input
-                      type="number"
-                      min="5"
-                      value={singleSlotForm.durationMinutes}
-                      onChange={(event) =>
-                        setSingleSlotForm((current) => ({ ...current, durationMinutes: event.target.value }))
-                      }
-                    />
-                  </Field>
-                  <button type="submit" className="button primary">
-                    Add slot
-                  </button>
+              <div className="availability-layout">
+                <form className="info-card availability-form" onSubmit={addSingleSlot}>
+                  <div className="availability-form-head">
+                    <div>
+                      <h3>Add single slot</h3>
+                      <p>Publish one exact consultation window for a specific date.</p>
+                    </div>
+                    <span className="pill pill-neutral">One-time</span>
+                  </div>
+                  <div className="availability-fields">
+                    <Field label="Date">
+                      <input
+                        type="date"
+                        value={singleSlotForm.date}
+                        onChange={(event) => setSingleSlotForm((current) => ({ ...current, date: event.target.value }))}
+                      />
+                    </Field>
+                    <Field label="Start time">
+                      <input
+                        type="time"
+                        value={singleSlotForm.startTime}
+                        onChange={(event) =>
+                          setSingleSlotForm((current) => ({ ...current, startTime: event.target.value }))
+                        }
+                      />
+                    </Field>
+                    <Field label="End time">
+                      <input
+                        type="time"
+                        value={singleSlotForm.endTime}
+                        onChange={(event) => setSingleSlotForm((current) => ({ ...current, endTime: event.target.value }))}
+                      />
+                    </Field>
+                    <Field label="Duration minutes">
+                      <input
+                        type="number"
+                        min="5"
+                        value={singleSlotForm.durationMinutes}
+                        onChange={(event) =>
+                          setSingleSlotForm((current) => ({ ...current, durationMinutes: event.target.value }))
+                        }
+                      />
+                    </Field>
+                  </div>
+                  <div className="availability-submit-row">
+                    <p className="muted">Best for one-off availability, special camps, or exceptions.</p>
+                    <button type="submit" className="button primary availability-submit-button">
+                      Add slot
+                    </button>
+                  </div>
                 </form>
 
-                <form className="info-card form-grid" onSubmit={addRecurringSlots}>
-                  <h3>Generate recurring slots</h3>
-                  <Field label="Start date">
-                    <input
-                      type="date"
-                      value={recurringForm.startDate}
-                      onChange={(event) =>
-                        setRecurringForm((current) => ({ ...current, startDate: event.target.value }))
-                      }
-                    />
-                  </Field>
-                  <Field label="End date">
-                    <input
-                      type="date"
-                      value={recurringForm.endDate}
-                      onChange={(event) =>
-                        setRecurringForm((current) => ({ ...current, endDate: event.target.value }))
-                      }
-                    />
-                  </Field>
-                  <Field label="Start time">
-                    <input
-                      type="time"
-                      value={recurringForm.startTime}
-                      onChange={(event) =>
-                        setRecurringForm((current) => ({ ...current, startTime: event.target.value }))
-                      }
-                    />
-                  </Field>
-                  <Field label="End time">
-                    <input
-                      type="time"
-                      value={recurringForm.endTime}
-                      onChange={(event) =>
-                        setRecurringForm((current) => ({ ...current, endTime: event.target.value }))
-                      }
-                    />
-                  </Field>
-                  <Field label="Duration minutes">
-                    <input
-                      type="number"
-                      min="5"
-                      value={recurringForm.durationMinutes}
-                      onChange={(event) =>
-                        setRecurringForm((current) => ({ ...current, durationMinutes: event.target.value }))
-                      }
-                    />
-                  </Field>
-                  <Field label="Pattern">
-                    <select
-                      value={recurringForm.recurrenceType}
-                      onChange={(event) =>
-                        setRecurringForm((current) => ({ ...current, recurrenceType: event.target.value }))
-                      }
-                    >
-                      {RECURRENCE_TYPES.map((type) => (
-                        <option key={type} value={type}>
-                          {formatEnum(type)}
-                        </option>
-                      ))}
-                    </select>
-                  </Field>
-                  <Field label="Custom interval days">
-                    <input
-                      type="number"
-                      min="1"
-                      value={recurringForm.intervalDays}
-                      onChange={(event) =>
-                        setRecurringForm((current) => ({ ...current, intervalDays: event.target.value }))
-                      }
-                    />
-                  </Field>
-                  <div className="checkbox-grid">
-                    {DAYS_OF_WEEK.map((day) => (
-                      <label key={day} className="checkbox-chip">
-                        <input
-                          type="checkbox"
-                          checked={recurringForm.daysOfWeek.includes(day)}
-                          onChange={(event) =>
-                            setRecurringForm((current) => ({
-                              ...current,
-                              daysOfWeek: event.target.checked
-                                ? [...current.daysOfWeek, day]
-                                : current.daysOfWeek.filter((item) => item !== day)
-                            }))
-                          }
-                        />
-                        <span>{formatEnum(day)}</span>
-                      </label>
-                    ))}
+                <form className="info-card availability-form" onSubmit={addRecurringSlots}>
+                  <div className="availability-form-head">
+                    <div>
+                      <h3>Generate recurring slots</h3>
+                      <p>Create a repeatable slot pattern across a date range.</p>
+                    </div>
+                    <span className="pill pill-neutral">Repeating</span>
                   </div>
-                  <button type="submit" className="button primary">
-                    Generate slots
-                  </button>
+                  <div className="availability-fields">
+                    <Field label="Start date">
+                      <input
+                        type="date"
+                        value={recurringForm.startDate}
+                        onChange={(event) =>
+                          setRecurringForm((current) => ({ ...current, startDate: event.target.value }))
+                        }
+                      />
+                    </Field>
+                    <Field label="End date">
+                      <input
+                        type="date"
+                        value={recurringForm.endDate}
+                        onChange={(event) =>
+                          setRecurringForm((current) => ({ ...current, endDate: event.target.value }))
+                        }
+                      />
+                    </Field>
+                    <Field label="Start time">
+                      <input
+                        type="time"
+                        value={recurringForm.startTime}
+                        onChange={(event) =>
+                          setRecurringForm((current) => ({ ...current, startTime: event.target.value }))
+                        }
+                      />
+                    </Field>
+                    <Field label="End time">
+                      <input
+                        type="time"
+                        value={recurringForm.endTime}
+                        onChange={(event) =>
+                          setRecurringForm((current) => ({ ...current, endTime: event.target.value }))
+                        }
+                      />
+                    </Field>
+                    <Field label="Duration minutes">
+                      <input
+                        type="number"
+                        min="5"
+                        value={recurringForm.durationMinutes}
+                        onChange={(event) =>
+                          setRecurringForm((current) => ({ ...current, durationMinutes: event.target.value }))
+                        }
+                      />
+                    </Field>
+                    <Field label="Pattern">
+                      <select
+                        value={recurringForm.recurrenceType}
+                        onChange={(event) =>
+                          setRecurringForm((current) => ({ ...current, recurrenceType: event.target.value }))
+                        }
+                      >
+                        {RECURRENCE_TYPES.map((type) => (
+                          <option key={type} value={type}>
+                            {formatEnum(type)}
+                          </option>
+                        ))}
+                      </select>
+                    </Field>
+                    <Field label="Custom interval days">
+                      <input
+                        type="number"
+                        min="1"
+                        value={recurringForm.intervalDays}
+                        onChange={(event) =>
+                          setRecurringForm((current) => ({ ...current, intervalDays: event.target.value }))
+                        }
+                      />
+                    </Field>
+                  </div>
+                  <div className="availability-days">
+                    <span className="availability-group-label">Repeat on</span>
+                    <div className="checkbox-grid">
+                      {DAYS_OF_WEEK.map((day) => (
+                        <label key={day} className="checkbox-chip">
+                          <input
+                            type="checkbox"
+                            checked={recurringForm.daysOfWeek.includes(day)}
+                            onChange={(event) =>
+                              setRecurringForm((current) => ({
+                                ...current,
+                                daysOfWeek: event.target.checked
+                                  ? [...current.daysOfWeek, day]
+                                  : current.daysOfWeek.filter((item) => item !== day)
+                              }))
+                            }
+                          />
+                          <span>{formatEnum(day)}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="availability-submit-row">
+                    <p className="muted">Use weekly or custom patterns to fill your calendar faster.</p>
+                    <button type="submit" className="button primary availability-submit-button">
+                      Generate slots
+                    </button>
+                  </div>
                 </form>
               </div>
 
@@ -2750,17 +3492,18 @@ function ProviderDashboard() {
                           <span className={classNames("pill", `pill-${statusTone(slot.blocked ? "FAILED" : slot.booked ? "PENDING" : "ACTIVE")}`)}>
                             {slot.blocked ? "Blocked" : slot.booked ? "Booked" : "Open"}
                           </span>
-                          <span className="muted">
-                            {formatDate(slot.date)} • {formatTime(slot.startTime)} - {formatTime(slot.endTime)}
+                          <span className="muted slot-datetime">
+                            <span>{formatDate(slot.date)}</span>
+                            <span>
+                              {formatTime(slot.startTime)} - {formatTime(slot.endTime)}
+                            </span>
                           </span>
                         </div>
-                        <p>
-                          Slot {slot.slotId} • {slot.durationMinutes} mins
-                        </p>
+                        <p>{slot.durationMinutes} mins</p>
                         {slot.blockedReason ? <p className="muted">Reason: {slot.blockedReason}</p> : null}
-                        <details className="details-card">
-                          <summary>Edit slot</summary>
-                          <div className="form-grid">
+                        <details className="details-card slot-details-card">
+                          <summary className="slot-details-summary">Edit slot</summary>
+                          <div className="form-grid slot-details-grid">
                             <Field label="Date">
                               <input
                                 type="date"
@@ -2831,32 +3574,49 @@ function ProviderDashboard() {
                               />
                             </Field>
                           </div>
-                          <button type="button" className="button ghost" onClick={() => updateSlot(slot.slotId)}>
+                          <button
+                            type="button"
+                            className="button slot-action-button slot-action-edit slot-details-button"
+                            onClick={() => updateSlot(slot.slotId)}
+                          >
                             Save slot changes
                           </button>
                         </details>
                         <div className="row-actions">
                           {slot.blocked ? (
-                            <button type="button" className="button ghost" onClick={() => unblockSlot(slot.slotId)}>
+                            <button
+                              type="button"
+                              className="button slot-action-button slot-action-unblock"
+                              onClick={() => unblockSlot(slot.slotId)}
+                            >
                               Unblock
                             </button>
                           ) : (
-                            <details className="details-card">
-                              <summary>Block</summary>
+                            <details className="details-card slot-details-card slot-block-card">
+                              <summary className="slot-details-summary">Block slot</summary>
                               <Field label="Reason">
                                 <input
                                   value={blockReasons[slot.slotId] || ""}
                                   onChange={(event) =>
                                     setBlockReasons((current) => ({ ...current, [slot.slotId]: event.target.value }))
                                   }
+                                  placeholder="Optional note for leave, break, or emergency"
                                 />
                               </Field>
-                              <button type="button" className="button ghost danger" onClick={() => blockSlot(slot.slotId)}>
+                              <button
+                                type="button"
+                                className="button slot-action-button slot-action-block slot-details-button"
+                                onClick={() => blockSlot(slot.slotId)}
+                              >
                                 Confirm block
                               </button>
                             </details>
                           )}
-                          <button type="button" className="button ghost danger" onClick={() => deleteSlot(slot.slotId)}>
+                          <button
+                            type="button"
+                            className="button slot-action-button slot-action-delete"
+                            onClick={() => deleteSlot(slot.slotId)}
+                          >
                             Delete
                           </button>
                         </div>
@@ -2898,7 +3658,6 @@ function ProviderDashboard() {
                       <span>{formatTime(appointment.startTime)} - {formatTime(appointment.endTime)}</span>
                     </div>
                     <h3>{appointment.serviceType}</h3>
-                    <p>Patient {appointment.patientId}</p>
                     <div className="form-grid">
                       <Field label="Completion notes">
                         <input
@@ -2955,11 +3714,10 @@ function ProviderDashboard() {
                         {formatEnum(appointment.status)}
                       </span>
                       <span className="muted">
-                        {formatDate(appointment.appointmentDate)} • {formatTime(appointment.startTime)} - {formatTime(appointment.endTime)}
+                        {formatDate(appointment.appointmentDate)} â€¢ {formatTime(appointment.startTime)} - {formatTime(appointment.endTime)}
                       </span>
                     </div>
                     <h3>{appointment.serviceType}</h3>
-                    <p>Patient {appointment.patientId}</p>
                   </article>
                 ))}
               </div>
@@ -3064,7 +3822,7 @@ function ProviderDashboard() {
                 {records.data.map((record) => (
                   <article key={record.recordId} className="info-card">
                     <div className="meta-row">
-                      <span className="pill pill-neutral">Appointment {record.appointmentId}</span>
+                      <span className="pill pill-neutral">Medical record</span>
                       <span className="muted">{formatInstant(record.updatedAt || record.createdAt)}</span>
                     </div>
                     <h3>{record.diagnosis}</h3>
@@ -3162,7 +3920,7 @@ function ProviderDashboard() {
                     <span className="pill pill-warning">{review.rating} / 5</span>
                     <span className="muted">{formatInstant(review.reviewDate)}</span>
                   </div>
-                  <h3>Appointment {review.appointmentId}</h3>
+                  <h3>Appointment review</h3>
                   <p>{review.comment || "No written comment."}</p>
                   {review.flagged ? <p className="muted">Already flagged: {review.flagReason}</p> : null}
                   {!review.flagged ? (
@@ -3524,9 +4282,7 @@ function AdminDashboard() {
                     <span>{formatDate(appointment.appointmentDate)}</span>
                   </div>
                   <h3>{appointment.serviceType}</h3>
-                  <p>
-                    Patient {appointment.patientId} • Provider {appointment.providerId}
-                  </p>
+                  <p>Scheduled consultation</p>
                 </article>
               ))}
             </div>
@@ -3570,10 +4326,8 @@ function AdminDashboard() {
                       </span>
                       <span>{formatCurrency(payment.amount, payment.currency || "INR")}</span>
                     </div>
-                    <h3>Payment {payment.paymentId}</h3>
-                    <p>
-                      Appointment {payment.appointmentId} • {formatEnum(payment.mode)}
-                    </p>
+                    <h3>Payment transaction</h3>
+                    <p>{formatEnum(payment.mode)}</p>
                     <div className="form-grid">
                       <Field label="New status">
                         <select
@@ -3755,9 +4509,7 @@ function AdminDashboard() {
                     </div>
                     <h3>{notification.title}</h3>
                     <p>{notification.message}</p>
-                    <span className="muted">
-                      Recipient {notification.recipientId} • {formatEnum(notification.channel)}
-                    </span>
+                    <span className="muted">{formatEnum(notification.channel)}</span>
                   </article>
                 ))}
               </div>
@@ -3828,12 +4580,19 @@ function AdminDashboard() {
 
 export default function App() {
   const [authState, setAuthState] = usePersistentState("medibook-auth", null);
+  const [themeMode, setThemeMode] = usePersistentState("medibook-theme", "light");
   const authStateRef = useRef(authState);
+  const initialSessionRef = useRef(authState);
+  const [authReady, setAuthReady] = useState(() => !initialSessionRef.current?.accessToken);
   const [notice, setNotice] = useState(null);
 
   useEffect(() => {
     authStateRef.current = authState;
   }, [authState]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = themeMode || "light";
+  }, [themeMode]);
 
   useEffect(() => {
     bindAuthHandlers({
@@ -3842,6 +4601,45 @@ export default function App() {
       clearAuthState: () => setAuthState(null)
     });
   }, []);
+
+  useEffect(() => {
+    let active = true;
+
+    async function bootstrapStoredSession() {
+      if (!initialSessionRef.current?.accessToken) {
+        if (active) {
+          setAuthReady(true);
+        }
+        return;
+      }
+
+      try {
+        if (initialSessionRef.current.refreshToken) {
+          await refreshAuthSession();
+        } else {
+          const user = await apiRequest("/api/v1/auth/profile");
+          if (active) {
+            setAuthState((current) => (current ? { ...current, user } : current));
+          }
+        }
+      } catch (error) {
+        if (active) {
+          setAuthState(null);
+          setNotice({ message: "Your saved session is no longer valid. Please sign in again." });
+        }
+      } finally {
+        if (active) {
+          setAuthReady(true);
+        }
+      }
+    }
+
+    bootstrapStoredSession();
+
+    return () => {
+      active = false;
+    };
+  }, [setAuthState]);
 
   useEffect(() => {
     if (!notice) {
@@ -3861,6 +4659,7 @@ export default function App() {
       body: payload
     });
     setAuthState(normalizeAuthResponse(response));
+    setAuthReady(true);
     setNotice({ message: "Logged in successfully." });
   }
 
@@ -3870,10 +4669,29 @@ export default function App() {
       body: payload
     });
     setAuthState(normalizeAuthResponse(response));
+    setAuthReady(true);
     setNotice({ message: "Account created successfully." });
   }
 
-  async function logout() {
+  async function completeOAuthLogin(tokens) {
+    const user = await apiRequest("/api/v1/auth/profile", {
+      headers: {
+        Authorization: `Bearer ${tokens.accessToken}`
+      }
+    });
+
+    setAuthState({
+      accessToken: tokens.accessToken,
+      refreshToken: tokens.refreshToken,
+      tokenType: "Bearer",
+      expiresIn: null,
+      user
+    });
+    setAuthReady(true);
+    setNotice({ message: "Signed in with Google." });
+  }
+
+  async function logout(noticeMessage = "Logged out.") {
     try {
       await apiRequest("/api/v1/auth/logout", {
         method: "POST"
@@ -3882,7 +4700,7 @@ export default function App() {
       // Clear the local session even if the backend logout call fails.
     } finally {
       setAuthState(null);
-      setNotice({ message: "Logged out." });
+      setNotice({ message: noticeMessage });
     }
   }
 
@@ -3892,9 +4710,11 @@ export default function App() {
 
   const authValue = {
     authState,
+    ready: authReady,
     user: authState?.user || null,
     login,
     register,
+    completeOAuthLogin,
     logout,
     mergeUser
   };
@@ -3902,10 +4722,17 @@ export default function App() {
   return (
     <AuthContext.Provider value={authValue}>
       <AppErrorBoundary>
-        <AppShell notice={notice} onClearNotice={() => setNotice(null)}>
+        <AppShell
+          notice={notice}
+          onClearNotice={() => setNotice(null)}
+          themeMode={themeMode || "light"}
+          onToggleTheme={() => setThemeMode((current) => (current === "dark" ? "light" : "dark"))}
+        >
           <Routes>
             <Route path="/" element={<HomePage />} />
             <Route path="/auth" element={<AuthPage />} />
+            <Route path="/reset-password" element={<ResetPasswordPage />} />
+            <Route path="/oauth2/redirect" element={<OAuthRedirectPage />} />
             <Route path="/providers/:providerId" element={<ProviderDetailPage />} />
             <Route
               path="/dashboard"

@@ -33,4 +33,5 @@ Copy `.env.example` to `.env` if you want to override the backend URL.
 
 ```env
 VITE_API_BASE_URL=http://localhost:8080
+VITE_RAZORPAY_CHECKOUT_URL=https://checkout.razorpay.com/v1/checkout.js
 ```
