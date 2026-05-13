@@ -753,6 +753,7 @@ function AppShell({ children, notice, onClearNotice, themeMode, onToggleTheme })
         <nav className="topnav">
           <NavLink to="/">Home</NavLink>
           {auth.user ? <NavLink to="/dashboard">Dashboard</NavLink> : null}
+          {auth.user ? <NavLink to="/profile">Profile</NavLink> : null}
           {!auth.user ? <NavLink to="/auth">Login / Register</NavLink> : null}
         </nav>
         <div className="topbar-side">
@@ -1851,11 +1852,39 @@ function DashboardPage() {
           Manage the flows tied to your role while staying connected to the same backend services and
           business rules.
         </p>
+        <div className="row-actions">
+          <Link to="/profile" className="button primary">
+            View Profile
+          </Link>
+        </div>
       </section>
 
       {auth.user.role === "PATIENT" ? <PatientDashboard /> : null}
       {auth.user.role === "PROVIDER" ? <ProviderDashboard /> : null}
       {auth.user.role === "ADMIN" ? <AdminDashboard /> : null}
+    </div>
+  );
+}
+
+function ProfilePage() {
+  const auth = useAuth();
+
+  if (!auth.user) {
+    return null;
+  }
+
+  return (
+    <div className="page-stack">
+      <section className="hero-panel dashboard-hero">
+        <span className="eyebrow">Account Profile</span>
+        <h1>{auth.user.fullName}</h1>
+        <p>Review your account details, update contact info, and manage password or account access here.</p>
+        <div className="row-actions">
+          <Link to="/dashboard" className="button ghost">
+            Back to Dashboard
+          </Link>
+        </div>
+      </section>
 
       <AccountPanel />
     </div>
@@ -4739,6 +4768,14 @@ export default function App() {
               element={
                 <ProtectedRoute>
                   <DashboardPage />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/profile"
+              element={
+                <ProtectedRoute>
+                  <ProfilePage />
                 </ProtectedRoute>
               }
             />
